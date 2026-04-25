@@ -122,6 +122,14 @@ pub(crate) enum Command {
     /// This command reads the IC status.
     GetStatus = 0x71,
 
+    /// Enter partial-refresh mode. Subsequent DTM2/Refresh use the partial window.
+    PartialIn = 0x91,
+    /// Leave partial-refresh mode and return the panel to full-frame addressing.
+    PartialOut = 0x92,
+    /// Define the partial-refresh window: x_start_h, x_start_l, x_end_h, x_end_l-1,
+    /// y_start_h, y_start_l, y_end_h, y_end_l-1, gates_first (PT_SCAN bit, 0x01).
+    PartialWindow = 0x90,
+
     /// This command implements related VCOM sensing setting.
     AutoMeasurementVcom = 0x80,
     /// This command gets the VCOM value.

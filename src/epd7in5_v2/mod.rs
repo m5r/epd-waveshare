@@ -146,15 +146,66 @@ where
 
     fn update_partial_frame(
         &mut self,
-        _spi: &mut SPI,
-        _delay: &mut DELAY,
-        _buffer: &[u8],
-        _x: u32,
-        _y: u32,
-        _width: u32,
-        _height: u32,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        buffer: &[u8],
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
     ) -> Result<(), SPI::Error> {
-        unimplemented!();
+        // UC8179 partial-window addressing is byte-aligned on the x axis (each byte =
+        // 8 horizontal pixels). The reference C demo enforces this by construction;
+        // we panic so callers don't silently scramble pixels with off-by-bit windows.
+        assert!(x % 8 == 0, "epd7in5_v2: partial x must be multiple of 8");
+        assert!(width % 8 == 0, "epd7in5_v2: partial width must be multiple of 8");
+        let row_bytes = (width / 8) as usize;
+        assert_eq!(
+            buffer.len(),
+            row_bytes * height as usize,
+            "epd7in5_v2: partial buffer size mismatch",
+        );
+
+        self.wait_until_idle(spi, delay)?;
+
+        // CDI = 0xA9 selects the differential (KW) waveform path used during partial
+        // refresh; the init value (0x10) drives the full LUT and would ghost badly.
+        // Restored at the end so subsequent full refreshes are unaffected.
+        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0xA9, 0x07])?;
+
+        self.command(spi, Command::PartialIn)?;
+
+        let x_end = x + width - 1;
+        let y_end = y + height - 1;
+        self.cmd_with_data(
+            spi,
+            Command::PartialWindow,
+            &[
+                (x >> 8) as u8,
+                (x & 0xFF) as u8,
+                (x_end >> 8) as u8,
+                (x_end & 0xFF) as u8,
+                (y >> 8) as u8,
+                (y & 0xFF) as u8,
+                (y_end >> 8) as u8,
+                (y_end & 0xFF) as u8,
+                0x01,
+            ],
+        )?;
+
+        // Waveshare reference writes the framebuffer raw to DTM2 (0x13) for partial
+        // refresh — opposite polarity from the full-refresh DTM2 path which inverts.
+        // The CDI=0xA9 LUT compensates, so raw bytes here render correctly.
+        self.cmd_with_data(spi, Command::DataStartTransmission2, buffer)?;
+
+        self.command(spi, Command::DisplayRefresh)?;
+        self.wait_until_idle(spi, delay)?;
+
+        self.command(spi, Command::PartialOut)?;
+
+        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x10, 0x07])?;
+
+        Ok(())
     }
 
     fn display_frame(&mut self, spi: &mut SPI, delay: &mut DELAY) -> Result<(), SPI::Error> {
