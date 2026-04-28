@@ -434,6 +434,80 @@ where
         Ok(())
     }
 
+    /// Windowed partial refresh that re-establishes both DTM1 (old) and DTM2
+    /// (new) before triggering. Required after the panel's `0x07 DeepSleep`
+    /// because UC8179 RAM is not retained — the controller's stored DTM1 is
+    /// gone and the differential `CDI=0xA9` waveform needs both registers
+    /// populated to compute per-pixel transitions correctly.
+    ///
+    /// `old_buffer` is the framebuffer that's currently on glass in the
+    /// window; `new_buffer` is the target. Both must be `(width / 8) * height`
+    /// bytes. Both are sent raw (matching the polarity the previous full
+    /// refresh would have left in DTM1 — see `update_frame` for the polarity
+    /// rationale: full refresh writes DTM1=raw, DTM2=inverted under
+    /// `CDI=0x10`; partial under `CDI=0xA9` reads the differential, so the
+    /// DTM1 value the panel last saw was `raw`).
+    pub fn update_partial_frame_dual_with_timeout(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        old_buffer: &[u8],
+        new_buffer: &[u8],
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        timeout_us: u32,
+    ) -> Result<(), BusyTimeoutError<SPI::Error>> {
+        assert!(x % 8 == 0, "epd7in5_v2: partial x must be multiple of 8");
+        assert!(width % 8 == 0, "epd7in5_v2: partial width must be multiple of 8");
+        let row_bytes = (width / 8) as usize;
+        assert_eq!(
+            old_buffer.len(),
+            row_bytes * height as usize,
+            "epd7in5_v2: partial old_buffer size mismatch",
+        );
+        assert_eq!(
+            new_buffer.len(),
+            row_bytes * height as usize,
+            "epd7in5_v2: partial new_buffer size mismatch",
+        );
+
+        self.wait_until_idle_with_timeout(spi, delay, timeout_us)?;
+
+        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0xA9, 0x07])?;
+        self.command(spi, Command::PartialIn)?;
+
+        let x_end = x + width - 1;
+        let y_end = y + height - 1;
+        self.cmd_with_data(
+            spi,
+            Command::PartialWindow,
+            &[
+                (x >> 8) as u8,
+                (x & 0xFF) as u8,
+                (x_end >> 8) as u8,
+                (x_end & 0xFF) as u8,
+                (y >> 8) as u8,
+                (y & 0xFF) as u8,
+                (y_end >> 8) as u8,
+                (y_end & 0xFF) as u8,
+                0x01,
+            ],
+        )?;
+
+        self.cmd_with_data(spi, Command::DataStartTransmission1, old_buffer)?;
+        self.cmd_with_data(spi, Command::DataStartTransmission2, new_buffer)?;
+
+        self.command(spi, Command::DisplayRefresh)?;
+        self.wait_until_idle_with_timeout(spi, delay, timeout_us)?;
+
+        self.command(spi, Command::PartialOut)?;
+        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x10, 0x07])?;
+
+        Ok(())
+    }
+
     /// `sleep` with a BUSY-wait cap on the post-PowerOff idle check. On
     /// timeout, the `0x07 DeepSleep` command is skipped and the error
     /// returned; the caller is expected to drop PWR to force a clean cold
