@@ -2,6 +2,26 @@ use crate::traits::Command;
 use core::marker::PhantomData;
 use embedded_hal::{delay::*, digital::*, spi::SpiDevice};
 
+/// Error type returned by the `*_with_timeout` family of operations on
+/// V2-class drivers (e.g. `Epd7in5`). `Spi(E)` wraps the underlying SPI error;
+/// `BusyTimeout` indicates BUSY stayed asserted past the supplied per-call cap.
+///
+/// `From<E>` is implemented so `?` from the underlying SPI error works
+/// cleanly inside timeout-aware methods.
+#[derive(Debug)]
+pub enum BusyTimeoutError<E> {
+    /// Underlying SPI bus error.
+    Spi(E),
+    /// BUSY stayed asserted past the per-call cap.
+    BusyTimeout,
+}
+
+impl<E> From<E> for BusyTimeoutError<E> {
+    fn from(err: E) -> Self {
+        Self::Spi(err)
+    }
+}
+
 /// The Connection Interface of all (?) Waveshare EPD-Devices
 ///
 /// SINGLE_BYTE_WRITE defines if a data block is written bytewise
@@ -182,6 +202,42 @@ where
             if self.delay_us > 0 {
                 delay.delay_us(self.delay_us);
             }
+        }
+        Ok(())
+    }
+
+    /// Bounded variant of [`wait_until_idle_with_cmd`]: returns
+    /// `BusyTimeoutError::BusyTimeout` if BUSY stays asserted past `timeout_us`.
+    /// Probes via `status_command` between polls so the V2 panel's `0x71
+    /// GetStatus` semantics are preserved.
+    ///
+    /// Elapsed time is approximated by counting polls × `self.delay_us`; SPI
+    /// command time is small relative to `delay_us` (default 10 ms) so the
+    /// overshoot is bounded by the poll period.
+    pub(crate) fn wait_until_idle_with_cmd_timeout<T: Command>(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        is_busy_low: bool,
+        status_command: T,
+        timeout_us: u32,
+    ) -> Result<(), BusyTimeoutError<SPI::Error>> {
+        self.cmd(spi, status_command)?;
+        if self.delay_us > 0 {
+            delay.delay_us(self.delay_us);
+        }
+        let poll_us = self.delay_us.max(1);
+        let max_polls = timeout_us / poll_us;
+        let mut polls: u32 = 0;
+        while self.is_busy(is_busy_low) {
+            if polls >= max_polls {
+                return Err(BusyTimeoutError::BusyTimeout);
+            }
+            self.cmd(spi, status_command)?;
+            if self.delay_us > 0 {
+                delay.delay_us(self.delay_us);
+            }
+            polls = polls.saturating_add(1);
         }
         Ok(())
     }

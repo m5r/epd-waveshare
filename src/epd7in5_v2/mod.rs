@@ -18,6 +18,7 @@ use embedded_hal::{
 
 use crate::color::Color;
 use crate::interface::DisplayInterface;
+pub use crate::interface::BusyTimeoutError;
 use crate::traits::{InternalWiAdditions, RefreshLut, WaveshareDisplay};
 
 pub(crate) mod command;
@@ -307,6 +308,185 @@ where
         self.send_data(spi, &[w as u8])?;
         self.send_data(spi, &[(h >> 8) as u8])?;
         self.send_data(spi, &[h as u8])
+    }
+}
+
+// ─── Timeout-aware variants ────────────────────────────────────────────────
+//
+// V2-specific inherent methods that wrap each operation containing an internal
+// BUSY wait with a per-call cap. The trait-level API in `WaveshareDisplay`
+// stays unchanged so existing call sites compile unchanged; new wake-flow code
+// (e.g. M4 in adhan_clock) uses these methods exclusively to surface a real
+// timeout instead of hanging on a stuck panel.
+impl<SPI, BUSY, DC, RST, DELAY> Epd7in5<SPI, BUSY, DC, RST, DELAY>
+where
+    SPI: SpiDevice,
+    BUSY: InputPin,
+    DC: OutputPin,
+    RST: OutputPin,
+    DELAY: DelayNs,
+{
+    /// Construct + run init with a BUSY-wait cap. Mirrors `WaveshareDisplay::new`
+    /// + `init`, replacing the post-PowerOn unbounded wait with a bounded one.
+    pub fn new_with_timeout(
+        spi: &mut SPI,
+        busy: BUSY,
+        dc: DC,
+        rst: RST,
+        delay: &mut DELAY,
+        delay_us: Option<u32>,
+        timeout_us: u32,
+    ) -> Result<Self, BusyTimeoutError<SPI::Error>> {
+        let interface = DisplayInterface::new(busy, dc, rst, delay_us);
+        let color = DEFAULT_BACKGROUND_COLOR;
+
+        let mut epd = Epd7in5 { interface, color };
+        epd.init_with_timeout(spi, delay, timeout_us)?;
+
+        Ok(epd)
+    }
+
+    /// Bounded poll on BUSY using V2's `0x71 GetStatus` probe between polls.
+    pub fn wait_until_idle_with_timeout(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        timeout_us: u32,
+    ) -> Result<(), BusyTimeoutError<SPI::Error>> {
+        self.interface.wait_until_idle_with_cmd_timeout(
+            spi,
+            delay,
+            IS_BUSY_LOW,
+            Command::GetStatus,
+            timeout_us,
+        )
+    }
+
+    /// `update_and_display_frame` with a BUSY-wait cap on the pre-flight idle
+    /// check. The DisplayRefresh that follows is fire-and-forget; the caller
+    /// is expected to call `wait_until_idle_with_timeout` afterward.
+    pub fn update_and_display_frame_with_timeout(
+        &mut self,
+        spi: &mut SPI,
+        buffer: &[u8],
+        delay: &mut DELAY,
+        timeout_us: u32,
+    ) -> Result<(), BusyTimeoutError<SPI::Error>> {
+        self.wait_until_idle_with_timeout(spi, delay, timeout_us)?;
+        self.update_frame_no_wait(spi, buffer)?;
+        self.command(spi, Command::DisplayRefresh)?;
+        Ok(())
+    }
+
+    /// `update_partial_frame` with a BUSY-wait cap on the pre-flight idle
+    /// check. Mirrors the trait method's window/byte-alignment asserts.
+    pub fn update_partial_frame_with_timeout(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        buffer: &[u8],
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        timeout_us: u32,
+    ) -> Result<(), BusyTimeoutError<SPI::Error>> {
+        assert!(x % 8 == 0, "epd7in5_v2: partial x must be multiple of 8");
+        assert!(width % 8 == 0, "epd7in5_v2: partial width must be multiple of 8");
+        let row_bytes = (width / 8) as usize;
+        assert_eq!(
+            buffer.len(),
+            row_bytes * height as usize,
+            "epd7in5_v2: partial buffer size mismatch",
+        );
+
+        self.wait_until_idle_with_timeout(spi, delay, timeout_us)?;
+
+        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0xA9, 0x07])?;
+        self.command(spi, Command::PartialIn)?;
+
+        let x_end = x + width - 1;
+        let y_end = y + height - 1;
+        self.cmd_with_data(
+            spi,
+            Command::PartialWindow,
+            &[
+                (x >> 8) as u8,
+                (x & 0xFF) as u8,
+                (x_end >> 8) as u8,
+                (x_end & 0xFF) as u8,
+                (y >> 8) as u8,
+                (y & 0xFF) as u8,
+                (y_end >> 8) as u8,
+                (y_end & 0xFF) as u8,
+                0x01,
+            ],
+        )?;
+
+        self.cmd_with_data(spi, Command::DataStartTransmission2, buffer)?;
+
+        self.command(spi, Command::DisplayRefresh)?;
+        self.wait_until_idle_with_timeout(spi, delay, timeout_us)?;
+
+        self.command(spi, Command::PartialOut)?;
+        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x10, 0x07])?;
+
+        Ok(())
+    }
+
+    /// `sleep` with a BUSY-wait cap on the post-PowerOff idle check. On
+    /// timeout, the `0x07 DeepSleep` command is skipped and the error
+    /// returned; the caller is expected to drop PWR to force a clean cold
+    /// reset on the next wake.
+    pub fn sleep_with_timeout(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        timeout_us: u32,
+    ) -> Result<(), BusyTimeoutError<SPI::Error>> {
+        self.wait_until_idle_with_timeout(spi, delay, timeout_us)?;
+        self.command(spi, Command::PowerOff)?;
+        self.wait_until_idle_with_timeout(spi, delay, timeout_us)?;
+        self.cmd_with_data(spi, Command::DeepSleep, &[0xA5])?;
+        Ok(())
+    }
+
+    /// `wake_up` with a BUSY-wait cap. Re-runs init via `init_with_timeout`.
+    pub fn wake_up_with_timeout(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        timeout_us: u32,
+    ) -> Result<(), BusyTimeoutError<SPI::Error>> {
+        self.init_with_timeout(spi, delay, timeout_us)
+    }
+
+    fn init_with_timeout(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        timeout_us: u32,
+    ) -> Result<(), BusyTimeoutError<SPI::Error>> {
+        self.interface.reset(delay, 10_000, 2_000);
+
+        self.cmd_with_data(spi, Command::PowerSetting, &[0x07, 0x07, 0x3f, 0x3f])?;
+        self.cmd_with_data(spi, Command::BoosterSoftStart, &[0x17, 0x17, 0x28, 0x17])?;
+        self.command(spi, Command::PowerOn)?;
+        delay.delay_ms(100);
+        self.wait_until_idle_with_timeout(spi, delay, timeout_us)?;
+        self.cmd_with_data(spi, Command::PanelSetting, &[0x1F])?;
+        self.cmd_with_data(spi, Command::TconResolution, &[0x03, 0x20, 0x01, 0xE0])?;
+        self.cmd_with_data(spi, Command::DualSpi, &[0x00])?;
+        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x10, 0x07])?;
+        self.cmd_with_data(spi, Command::TconSetting, &[0x22])?;
+        Ok(())
+    }
+
+    fn update_frame_no_wait(&mut self, spi: &mut SPI, buffer: &[u8]) -> Result<(), SPI::Error> {
+        self.cmd_with_data(spi, Command::DataStartTransmission1, buffer)?;
+        self.command(spi, Command::DataStartTransmission2)?;
+        self.interface.data_inverted(spi, buffer)?;
+        Ok(())
     }
 }
 
