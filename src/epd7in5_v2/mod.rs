@@ -79,7 +79,11 @@ where
         self.cmd_with_data(spi, Command::PanelSetting, &[0x1F])?;
         self.cmd_with_data(spi, Command::TconResolution, &[0x03, 0x20, 0x01, 0xE0])?;
         self.cmd_with_data(spi, Command::DualSpi, &[0x00])?;
-        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x10, 0x07])?;
+        // CDI byte1 0x20 selects BDV=10, driving the panel's VCOM border (the
+        // strip outside the 800x480 array) black. The Waveshare default 0x10
+        // (BDV=01) drives it white, which shows as a ~1px white gutter wherever
+        // the bezel exposes the border edge.
+        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x20, 0x07])?;
         self.cmd_with_data(spi, Command::TconSetting, &[0x22])?;
         Ok(())
     }
@@ -170,7 +174,7 @@ where
         self.wait_until_idle(spi, delay)?;
 
         // CDI = 0xA9 selects the differential (KW) waveform path used during partial
-        // refresh; the init value (0x10) drives the full LUT and would ghost badly.
+        // refresh; the init value (0x20) drives the full LUT and would ghost badly.
         // Restored at the end so subsequent full refreshes are unaffected.
         self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0xA9, 0x07])?;
 
@@ -204,7 +208,7 @@ where
 
         self.command(spi, Command::PartialOut)?;
 
-        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x10, 0x07])?;
+        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x20, 0x07])?;
 
         Ok(())
     }
@@ -429,7 +433,7 @@ where
         self.wait_until_idle_with_timeout(spi, delay, timeout_us)?;
 
         self.command(spi, Command::PartialOut)?;
-        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x10, 0x07])?;
+        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x20, 0x07])?;
 
         Ok(())
     }
@@ -503,7 +507,7 @@ where
         self.wait_until_idle_with_timeout(spi, delay, timeout_us)?;
 
         self.command(spi, Command::PartialOut)?;
-        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x10, 0x07])?;
+        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x20, 0x07])?;
 
         Ok(())
     }
@@ -551,7 +555,11 @@ where
         self.cmd_with_data(spi, Command::PanelSetting, &[0x1F])?;
         self.cmd_with_data(spi, Command::TconResolution, &[0x03, 0x20, 0x01, 0xE0])?;
         self.cmd_with_data(spi, Command::DualSpi, &[0x00])?;
-        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x10, 0x07])?;
+        // CDI byte1 0x20 selects BDV=10, driving the panel's VCOM border (the
+        // strip outside the 800x480 array) black. The Waveshare default 0x10
+        // (BDV=01) drives it white, which shows as a ~1px white gutter wherever
+        // the bezel exposes the border edge.
+        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x20, 0x07])?;
         self.cmd_with_data(spi, Command::TconSetting, &[0x22])?;
         Ok(())
     }
