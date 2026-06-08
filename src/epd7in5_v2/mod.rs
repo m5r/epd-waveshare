@@ -15,6 +15,7 @@ use embedded_hal::{
     digital::{InputPin, OutputPin},
     spi::SpiDevice,
 };
+use embedded_hal_async::{delay::DelayNs as AsyncDelayNs, spi::SpiDevice as AsyncSpiDevice};
 
 use crate::color::Color;
 use crate::interface::DisplayInterface;
@@ -43,6 +44,33 @@ pub const HEIGHT: u32 = 480;
 pub const DEFAULT_BACKGROUND_COLOR: Color = Color::White;
 const IS_BUSY_LOW: bool = true;
 const SINGLE_BYTE_WRITE: bool = false;
+
+/// Default SPI write chunk for the async cancellable framebuffer transfers. The
+/// cancel hook is checked once per chunk, so smaller chunks = finer cancel
+/// granularity at the cost of more SPI transactions. 4 KB ≈ one Linux SPI
+/// transfer cap and divides the 48 000-byte 800×480 framebuffer into 12 bands.
+const ASYNC_WRITE_CHUNK: usize = 4096;
+
+/// Outcome of an async, cooperatively-cancellable refresh operation.
+///
+/// `Completed` means the operation ran to its normal end. `Cancelled` means the
+/// caller's `should_cancel` hook returned true at a known command boundary, so
+/// the method stopped issuing SPI and returned early.
+///
+/// Cancellation is COOPERATIVE: the method observes `should_cancel` at each
+/// boundary (every BUSY poll, between framebuffer chunks, and immediately before
+/// `DisplayRefresh`) and returns `Cancelled` there. Dropping the future
+/// mid-`.await` is NOT the intended cancellation mechanism — it would strand the
+/// UC8179 mid-transaction. Callers that observe `Cancelled` from a method that
+/// had already issued `DisplayRefresh` (i.e. `wait_until_idle_*`) must treat the
+/// panel as mid-refresh and hard-reset it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// The operation ran to completion.
+    Completed,
+    /// The caller's cancel hook fired; the method stopped at a known boundary.
+    Cancelled,
+}
 
 /// Epd7in5 (V2) driver
 ///
@@ -568,6 +596,354 @@ where
         self.cmd_with_data(spi, Command::DataStartTransmission1, buffer)?;
         self.command(spi, Command::DataStartTransmission2)?;
         self.interface.data_inverted(spi, buffer)?;
+        Ok(())
+    }
+}
+
+// ─── Async, cooperatively-cancellable variants ─────────────────────────────
+//
+// Parallel to the blocking `*_with_timeout` family above, but driven by
+// `embedded_hal_async`: SPI command/data writes and the inter-poll delay
+// `.await`, so a single-core embassy cooperative executor runs other tasks
+// while a refresh is in flight (SPI writes) or while BUSY is asserted. The
+// blocking methods above are untouched; both paths coexist during the firmware
+// transition.
+//
+// Cancellation is COOPERATIVE. The three long-running methods take a
+// `should_cancel: &mut dyn FnMut() -> bool` (object-safe; the firmware can pass
+// a closure that polls an `AtomicBool`/signal). The hook is checked at every
+// BUSY poll, between framebuffer SPI chunks, and immediately before the
+// `DisplayRefresh` (0x12) trigger. When it fires, the method STOPS — issues no
+// further SPI — and returns `Ok(RefreshOutcome::Cancelled)`. Dropping the future
+// mid-`.await` is NOT the intended cancel mechanism: it would strand the UC8179
+// mid-transaction. See `RefreshOutcome` for the full contract.
+impl<SPI, BUSY, DC, RST, DELAY> Epd7in5<SPI, BUSY, DC, RST, DELAY>
+where
+    SPI: AsyncSpiDevice,
+    BUSY: InputPin,
+    DC: OutputPin,
+    RST: OutputPin,
+    DELAY: AsyncDelayNs,
+{
+    /// Async construct + init with a BUSY-wait cap. Mirrors
+    /// [`new_with_timeout`](Self::new_with_timeout). Plain async, NO cancel hook:
+    /// init is short and must run to completion to leave the panel in a usable
+    /// state.
+    pub async fn new_with_timeout_async(
+        spi: &mut SPI,
+        busy: BUSY,
+        dc: DC,
+        rst: RST,
+        delay: &mut DELAY,
+        delay_us: Option<u32>,
+        timeout_us: u32,
+    ) -> Result<Self, BusyTimeoutError<SPI::Error>> {
+        let interface = DisplayInterface::new(busy, dc, rst, delay_us);
+        let color = DEFAULT_BACKGROUND_COLOR;
+
+        let mut epd = Epd7in5 { interface, color };
+        epd.init_with_timeout_async(spi, delay, timeout_us).await?;
+
+        Ok(epd)
+    }
+
+    /// Async bounded BUSY-poll WITH a cancel hook. Probes V2's `0x71 GetStatus`
+    /// between polls and awaits the inter-poll delay so the executor runs other
+    /// tasks during the wait.
+    ///
+    /// Because the caller of a refresh has already issued `0x12 DisplayRefresh`
+    /// before awaiting idle, a `Cancelled` here means the panel is mid-refresh —
+    /// that is expected; the caller is responsible for a hard reset. This method
+    /// just reports `Cancelled` and issues no further SPI.
+    pub async fn wait_until_idle_with_timeout_async(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        timeout_us: u32,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<RefreshOutcome, BusyTimeoutError<SPI::Error>> {
+        let cancelled = self
+            .interface
+            .wait_until_idle_with_cmd_timeout_async(
+                spi,
+                delay,
+                IS_BUSY_LOW,
+                Command::GetStatus,
+                timeout_us,
+                should_cancel,
+            )
+            .await?;
+        Ok(if cancelled {
+            RefreshOutcome::Cancelled
+        } else {
+            RefreshOutcome::Completed
+        })
+    }
+
+    /// Async `update_and_display_frame` WITH a cancel hook. Drains to idle, then
+    /// streams the framebuffer to DTM1 (raw) and DTM2 (inverted) in
+    /// `ASYNC_WRITE_CHUNK`-byte bands, checking `should_cancel` after the
+    /// preflight idle wait, at each DTM phase boundary, between bands, and once
+    /// more immediately before issuing `DisplayRefresh` (0x12). The
+    /// DisplayRefresh is fire-and-forget; the caller awaits idle separately via
+    /// [`wait_until_idle_with_timeout_async`](Self::wait_until_idle_with_timeout_async).
+    ///
+    /// On cancel, returns `RefreshOutcome::Cancelled` having issued no
+    /// `DisplayRefresh`, so the panel is left idle (no refresh started).
+    pub async fn update_and_display_frame_with_timeout_async(
+        &mut self,
+        spi: &mut SPI,
+        buffer: &[u8],
+        delay: &mut DELAY,
+        timeout_us: u32,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<RefreshOutcome, BusyTimeoutError<SPI::Error>> {
+        if self
+            .wait_until_idle_with_timeout_async(spi, delay, timeout_us, should_cancel)
+            .await?
+            == RefreshOutcome::Cancelled
+        {
+            return Ok(RefreshOutcome::Cancelled);
+        }
+        // A cancel latched on entry (panel already idle, so the preflight wait
+        // returned immediately without polling the hook) is caught here before
+        // streaming the whole DTM1 band sequence.
+        if should_cancel() {
+            return Ok(RefreshOutcome::Cancelled);
+        }
+
+        // DTM1 = raw framebuffer, chunked with a cancel check per band.
+        self.interface.cmd_async(spi, Command::DataStartTransmission1).await?;
+        for band in buffer.chunks(ASYNC_WRITE_CHUNK) {
+            if should_cancel() {
+                return Ok(RefreshOutcome::Cancelled);
+            }
+            self.interface.data_async(spi, band).await?;
+        }
+
+        // A cancel latched during the final DTM1 band is caught here before
+        // streaming the whole DTM2 band sequence.
+        if should_cancel() {
+            return Ok(RefreshOutcome::Cancelled);
+        }
+        // DTM2 = bitwise-inverted framebuffer (see `update_frame` polarity note),
+        // chunked with the same per-band cancel check.
+        self.interface.cmd_async(spi, Command::DataStartTransmission2).await?;
+        for band in buffer.chunks(ASYNC_WRITE_CHUNK) {
+            if should_cancel() {
+                return Ok(RefreshOutcome::Cancelled);
+            }
+            self.interface.data_inverted_async(spi, band).await?;
+        }
+
+        if should_cancel() {
+            return Ok(RefreshOutcome::Cancelled);
+        }
+        self.interface.cmd_async(spi, Command::DisplayRefresh).await?;
+        Ok(RefreshOutcome::Completed)
+    }
+
+    /// Async dual-buffer windowed partial refresh WITH a cancel hook. Mirrors
+    /// [`update_partial_frame_dual_with_timeout`](Self::update_partial_frame_dual_with_timeout):
+    /// re-establishes DTM1 (`old_buffer`) and DTM2 (`new_buffer`) under the
+    /// differential `CDI=0xA9` waveform, both sent raw. `should_cancel` is
+    /// checked at the pre-flight idle wait, on entry before switching to
+    /// PartialIn mode, between framebuffer bands, immediately before
+    /// `DisplayRefresh`, and at the post-refresh idle wait.
+    ///
+    /// On cancel BEFORE `DisplayRefresh`, returns `Cancelled` with no refresh
+    /// started (panel left idle, though already in PartialIn mode — caller
+    /// hard-resets). On cancel DURING the post-refresh wait, the panel is
+    /// mid-refresh and the caller must hard-reset.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_partial_frame_dual_with_timeout_async(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        old_buffer: &[u8],
+        new_buffer: &[u8],
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        timeout_us: u32,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<RefreshOutcome, BusyTimeoutError<SPI::Error>> {
+        assert!(x % 8 == 0, "epd7in5_v2: partial x must be multiple of 8");
+        assert!(width % 8 == 0, "epd7in5_v2: partial width must be multiple of 8");
+        let row_bytes = (width / 8) as usize;
+        assert_eq!(
+            old_buffer.len(),
+            row_bytes * height as usize,
+            "epd7in5_v2: partial old_buffer size mismatch",
+        );
+        assert_eq!(
+            new_buffer.len(),
+            row_bytes * height as usize,
+            "epd7in5_v2: partial new_buffer size mismatch",
+        );
+
+        if self
+            .wait_until_idle_with_timeout_async(spi, delay, timeout_us, should_cancel)
+            .await?
+            == RefreshOutcome::Cancelled
+        {
+            return Ok(RefreshOutcome::Cancelled);
+        }
+        // A cancel latched on entry is caught here before the panel is switched
+        // into PartialIn mode (which would otherwise require a hard reset).
+        if should_cancel() {
+            return Ok(RefreshOutcome::Cancelled);
+        }
+
+        self.interface
+            .cmd_with_data_async(spi, Command::VcomAndDataIntervalSetting, &[0xA9, 0x07])
+            .await?;
+        self.interface.cmd_async(spi, Command::PartialIn).await?;
+
+        let x_end = x + width - 1;
+        let y_end = y + height - 1;
+        self.interface
+            .cmd_with_data_async(
+                spi,
+                Command::PartialWindow,
+                &[
+                    (x >> 8) as u8,
+                    (x & 0xFF) as u8,
+                    (x_end >> 8) as u8,
+                    (x_end & 0xFF) as u8,
+                    (y >> 8) as u8,
+                    (y & 0xFF) as u8,
+                    (y_end >> 8) as u8,
+                    (y_end & 0xFF) as u8,
+                    0x01,
+                ],
+            )
+            .await?;
+
+        // DTM1 = old (raw), chunked with a per-band cancel check.
+        self.interface.cmd_async(spi, Command::DataStartTransmission1).await?;
+        for band in old_buffer.chunks(ASYNC_WRITE_CHUNK) {
+            if should_cancel() {
+                return Ok(RefreshOutcome::Cancelled);
+            }
+            self.interface.data_async(spi, band).await?;
+        }
+
+        // DTM2 = new (raw), chunked with a per-band cancel check.
+        self.interface.cmd_async(spi, Command::DataStartTransmission2).await?;
+        for band in new_buffer.chunks(ASYNC_WRITE_CHUNK) {
+            if should_cancel() {
+                return Ok(RefreshOutcome::Cancelled);
+            }
+            self.interface.data_async(spi, band).await?;
+        }
+
+        if should_cancel() {
+            return Ok(RefreshOutcome::Cancelled);
+        }
+        self.interface.cmd_async(spi, Command::DisplayRefresh).await?;
+
+        if self
+            .wait_until_idle_with_timeout_async(spi, delay, timeout_us, should_cancel)
+            .await?
+            == RefreshOutcome::Cancelled
+        {
+            return Ok(RefreshOutcome::Cancelled);
+        }
+
+        self.interface.cmd_async(spi, Command::PartialOut).await?;
+        self.interface
+            .cmd_with_data_async(spi, Command::VcomAndDataIntervalSetting, &[0x20, 0x07])
+            .await?;
+
+        Ok(RefreshOutcome::Completed)
+    }
+
+    /// Async `sleep` with a BUSY-wait cap. Mirrors
+    /// [`sleep_with_timeout`](Self::sleep_with_timeout). Plain async, NO cancel
+    /// hook: the power-down sequence must run to completion.
+    pub async fn sleep_with_timeout_async(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        timeout_us: u32,
+    ) -> Result<(), BusyTimeoutError<SPI::Error>> {
+        // No-op cancel hook: this path is non-cancellable by contract.
+        let mut never_cancel = || false;
+        self.interface
+            .wait_until_idle_with_cmd_timeout_async(
+                spi,
+                delay,
+                IS_BUSY_LOW,
+                Command::GetStatus,
+                timeout_us,
+                &mut never_cancel,
+            )
+            .await?;
+        self.interface.cmd_async(spi, Command::PowerOff).await?;
+        self.interface
+            .wait_until_idle_with_cmd_timeout_async(
+                spi,
+                delay,
+                IS_BUSY_LOW,
+                Command::GetStatus,
+                timeout_us,
+                &mut never_cancel,
+            )
+            .await?;
+        self.interface
+            .cmd_with_data_async(spi, Command::DeepSleep, &[0xA5])
+            .await?;
+        Ok(())
+    }
+
+    /// Async init with a BUSY-wait cap. Plain async, NO cancel hook — mirrors
+    /// the blocking [`init_with_timeout`](Self::init_with_timeout).
+    async fn init_with_timeout_async(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        timeout_us: u32,
+    ) -> Result<(), BusyTimeoutError<SPI::Error>> {
+        self.interface.reset_async(delay, 10_000, 2_000).await;
+
+        self.interface
+            .cmd_with_data_async(spi, Command::PowerSetting, &[0x07, 0x07, 0x3f, 0x3f])
+            .await?;
+        self.interface
+            .cmd_with_data_async(spi, Command::BoosterSoftStart, &[0x17, 0x17, 0x28, 0x17])
+            .await?;
+        self.interface.cmd_async(spi, Command::PowerOn).await?;
+        delay.delay_ms(100).await;
+
+        let mut never_cancel = || false;
+        self.interface
+            .wait_until_idle_with_cmd_timeout_async(
+                spi,
+                delay,
+                IS_BUSY_LOW,
+                Command::GetStatus,
+                timeout_us,
+                &mut never_cancel,
+            )
+            .await?;
+
+        self.interface
+            .cmd_with_data_async(spi, Command::PanelSetting, &[0x1F])
+            .await?;
+        self.interface
+            .cmd_with_data_async(spi, Command::TconResolution, &[0x03, 0x20, 0x01, 0xE0])
+            .await?;
+        self.interface
+            .cmd_with_data_async(spi, Command::DualSpi, &[0x00])
+            .await?;
+        self.interface
+            .cmd_with_data_async(spi, Command::VcomAndDataIntervalSetting, &[0x20, 0x07])
+            .await?;
+        self.interface
+            .cmd_with_data_async(spi, Command::TconSetting, &[0x22])
+            .await?;
         Ok(())
     }
 }

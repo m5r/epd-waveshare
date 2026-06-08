@@ -1,6 +1,7 @@
 use crate::traits::Command;
 use core::marker::PhantomData;
 use embedded_hal::{delay::*, digital::*, spi::SpiDevice};
+use embedded_hal_async::{delay::DelayNs as AsyncDelayNs, spi::SpiDevice as AsyncSpiDevice};
 
 /// Error type returned by the `*_with_timeout` family of operations on
 /// V2-class drivers (e.g. `Epd7in5`). `Spi(E)` wraps the underlying SPI error;
@@ -41,14 +42,14 @@ pub(crate) struct DisplayInterface<SPI, BUSY, DC, RST, DELAY, const SINGLE_BYTE_
     delay_us: u32,
 }
 
+// GPIO-only helpers. These touch only the BUSY/DC/RST pins (and the cached
+// `delay_us`), never the SPI bus or a delay provider, so they're available to
+// both the blocking and async impl blocks regardless of which `SpiDevice` /
+// `DelayNs` flavor `SPI`/`DELAY` implement.
 impl<SPI, BUSY, DC, RST, DELAY, const SINGLE_BYTE_WRITE: bool>
     DisplayInterface<SPI, BUSY, DC, RST, DELAY, SINGLE_BYTE_WRITE>
 where
-    SPI: SpiDevice,
     BUSY: InputPin,
-    DC: OutputPin,
-    RST: OutputPin,
-    DELAY: DelayNs,
 {
     /// Creates a new `DisplayInterface` struct
     ///
@@ -66,6 +67,34 @@ where
         }
     }
 
+    /// Checks if device is still busy
+    ///
+    /// This is normally handled by the more complicated commands themselves,
+    /// but in the case you send data and commands directly you might need to check
+    /// if the device is still busy
+    ///
+    /// is_busy_low
+    ///
+    ///  - TRUE for epd4in2, epd2in13, epd2in7, epd5in83, epd7in5
+    ///  - FALSE for epd2in9, epd1in54 (for all Display Type A ones?)
+    ///
+    /// Most likely there was a mistake with the 2in9 busy connection
+    /// //TODO: use the #cfg feature to make this compile the right way for the certain types
+    pub(crate) fn is_busy(&mut self, is_busy_low: bool) -> bool {
+        (is_busy_low && self.busy.is_low().unwrap_or(false))
+            || (!is_busy_low && self.busy.is_high().unwrap_or(false))
+    }
+}
+
+impl<SPI, BUSY, DC, RST, DELAY, const SINGLE_BYTE_WRITE: bool>
+    DisplayInterface<SPI, BUSY, DC, RST, DELAY, SINGLE_BYTE_WRITE>
+where
+    SPI: SpiDevice,
+    BUSY: InputPin,
+    DC: OutputPin,
+    RST: OutputPin,
+    DELAY: DelayNs,
+{
     /// Basic function for sending [Commands](Command).
     ///
     /// Enables direct interaction with the device with the help of [data()](DisplayInterface::data())
@@ -242,24 +271,6 @@ where
         Ok(())
     }
 
-    /// Checks if device is still busy
-    ///
-    /// This is normally handled by the more complicated commands themselves,
-    /// but in the case you send data and commands directly you might need to check
-    /// if the device is still busy
-    ///
-    /// is_busy_low
-    ///
-    ///  - TRUE for epd4in2, epd2in13, epd2in7, epd5in83, epd7in5
-    ///  - FALSE for epd2in9, epd1in54 (for all Display Type A ones?)
-    ///
-    /// Most likely there was a mistake with the 2in9 busy connection
-    /// //TODO: use the #cfg feature to make this compile the right way for the certain types
-    pub(crate) fn is_busy(&mut self, is_busy_low: bool) -> bool {
-        (is_busy_low && self.busy.is_low().unwrap_or(false))
-            || (!is_busy_low && self.busy.is_high().unwrap_or(false))
-    }
-
     /// Resets the device.
     ///
     /// Often used to awake the module from deep sleep. See [Epd4in2::sleep()](Epd4in2::sleep())
@@ -277,5 +288,163 @@ where
         //TODO: the upstream libraries always sleep for 200ms here
         // 10ms works fine with just for the 7in5_v2 but this needs to be validated for other devices
         delay.delay_us(200_000);
+    }
+}
+
+// ─── Async interface ───────────────────────────────────────────────────────
+//
+// Async mirrors of the SPI-write / BUSY-poll / reset primitives, driven by
+// `embedded_hal_async::spi::SpiDevice` and `embedded_hal_async::delay::DelayNs`.
+// The SPI writes and the inter-poll delay `.await`, so a cooperative executor
+// runs other tasks while a refresh is in flight or BUSY is asserted. GPIO
+// (BUSY/DC/RST) stays on the blocking `embedded-hal` traits — those ops are
+// register pokes with no useful await point.
+//
+// Cancellation is COOPERATIVE: the BUSY-poll helper takes a `should_cancel`
+// hook and, when it returns true, stops polling and reports back so the caller
+// can return a `Cancelled` outcome at a known command boundary. Dropping the
+// future mid-`.await` is NOT the intended cancel mechanism — it would strand
+// the panel mid-transaction.
+impl<SPI, BUSY, DC, RST, DELAY, const SINGLE_BYTE_WRITE: bool>
+    DisplayInterface<SPI, BUSY, DC, RST, DELAY, SINGLE_BYTE_WRITE>
+where
+    SPI: AsyncSpiDevice,
+    BUSY: InputPin,
+    DC: OutputPin,
+    RST: OutputPin,
+    DELAY: AsyncDelayNs,
+{
+    /// Async SPI write. Mirrors [`write`](Self::write), awaiting each transfer.
+    async fn write_async(&mut self, spi: &mut SPI, data: &[u8]) -> Result<(), SPI::Error> {
+        // Linux's 4096-byte per-transfer cap (see `write`) is irrelevant on the
+        // embedded async path, but keep the same chunking guard for parity.
+        if cfg!(target_os = "linux") {
+            for data_chunk in data.chunks(4096) {
+                spi.write(data_chunk).await?;
+            }
+            Ok(())
+        } else {
+            spi.write(data).await
+        }
+    }
+
+    /// Async [`cmd`](Self::cmd).
+    pub(crate) async fn cmd_async<T: Command>(
+        &mut self,
+        spi: &mut SPI,
+        command: T,
+    ) -> Result<(), SPI::Error> {
+        let _ = self.dc.set_low();
+        self.write_async(spi, &[command.address()]).await
+    }
+
+    /// Async [`data`](Self::data).
+    pub(crate) async fn data_async(&mut self, spi: &mut SPI, data: &[u8]) -> Result<(), SPI::Error> {
+        let _ = self.dc.set_high();
+        if SINGLE_BYTE_WRITE {
+            for val in data.iter().copied() {
+                self.write_async(spi, &[val]).await?;
+            }
+        } else {
+            self.write_async(spi, data).await?;
+        }
+        Ok(())
+    }
+
+    /// Async [`cmd_with_data`](Self::cmd_with_data).
+    pub(crate) async fn cmd_with_data_async<T: Command>(
+        &mut self,
+        spi: &mut SPI,
+        command: T,
+        data: &[u8],
+    ) -> Result<(), SPI::Error> {
+        self.cmd_async(spi, command).await?;
+        self.data_async(spi, data).await
+    }
+
+    /// Async [`data_inverted`](Self::data_inverted).
+    pub(crate) async fn data_inverted_async(
+        &mut self,
+        spi: &mut SPI,
+        data: &[u8],
+    ) -> Result<(), SPI::Error> {
+        let _ = self.dc.set_high();
+        let mut chunk = [0u8; 256];
+        for source in data.chunks(chunk.len()) {
+            for (index, &byte) in source.iter().enumerate() {
+                chunk[index] = !byte;
+            }
+            self.write_async(spi, &chunk[..source.len()]).await?;
+        }
+        Ok(())
+    }
+
+    /// Async reset. Awaits each delay so the executor isn't frozen across the
+    /// ~210 ms reset pulse.
+    pub(crate) async fn reset_async(
+        &mut self,
+        delay: &mut DELAY,
+        initial_delay: u32,
+        duration: u32,
+    ) {
+        let _ = self.rst.set_high();
+        delay.delay_us(initial_delay).await;
+
+        let _ = self.rst.set_low();
+        delay.delay_us(duration).await;
+        let _ = self.rst.set_high();
+        delay.delay_us(200_000).await;
+    }
+
+    /// Async, cancellable bounded BUSY-poll. Mirrors
+    /// [`wait_until_idle_with_cmd_timeout`](Self::wait_until_idle_with_cmd_timeout):
+    /// probes `status_command` (V2's `0x71 GetStatus`) then awaits `poll_us`
+    /// between polls so other tasks run during the wait.
+    ///
+    /// Elapsed time is approximated by `polls × poll_us`; no real-time clock is
+    /// available in a generic `DelayNs`, so the overshoot is bounded by the poll
+    /// period (same accounting as the blocking variant).
+    ///
+    /// `should_cancel` is consulted before every poll. When it returns true this
+    /// returns `Ok(true)` (cancelled) WITHOUT issuing further SPI; on a clean
+    /// idle it returns `Ok(false)`. Cancellation is cooperative — see the module
+    /// note above; the caller turns `Ok(true)` into `RefreshOutcome::Cancelled`.
+    pub(crate) async fn wait_until_idle_with_cmd_timeout_async<T, ShouldCancel>(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        is_busy_low: bool,
+        status_command: T,
+        timeout_us: u32,
+        should_cancel: &mut ShouldCancel,
+    ) -> Result<bool, BusyTimeoutError<SPI::Error>>
+    where
+        T: Command,
+        ShouldCancel: FnMut() -> bool + ?Sized,
+    {
+        if should_cancel() {
+            return Ok(true);
+        }
+        self.cmd_async(spi, status_command).await?;
+        let poll_us = self.delay_us.max(1);
+        if self.delay_us > 0 {
+            delay.delay_us(self.delay_us).await;
+        }
+        let max_polls = timeout_us / poll_us;
+        let mut polls: u32 = 0;
+        while self.is_busy(is_busy_low) {
+            if should_cancel() {
+                return Ok(true);
+            }
+            if polls >= max_polls {
+                return Err(BusyTimeoutError::BusyTimeout);
+            }
+            self.cmd_async(spi, status_command).await?;
+            if self.delay_us > 0 {
+                delay.delay_us(self.delay_us).await;
+            }
+            polls = polls.saturating_add(1);
+        }
+        Ok(false)
     }
 }
