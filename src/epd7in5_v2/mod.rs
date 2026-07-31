@@ -18,8 +18,8 @@ use embedded_hal::{
 use embedded_hal_async::{delay::DelayNs as AsyncDelayNs, spi::SpiDevice as AsyncSpiDevice};
 
 use crate::color::Color;
-use crate::interface::DisplayInterface;
 pub use crate::interface::BusyTimeoutError;
+use crate::interface::DisplayInterface;
 use crate::traits::{InternalWiAdditions, RefreshLut, WaveshareDisplay};
 
 pub(crate) mod command;
@@ -71,6 +71,60 @@ pub enum RefreshOutcome {
     /// The caller's cancel hook fired; the method stopped at a known boundary.
     Cancelled,
 }
+
+/// Waveform source for the fast partial-refresh mode.
+///
+/// The plain init (`new_*` / `wake_up_*`) leaves PSR REG=0, so EVERY refresh —
+/// including the windowed "partial" — runs the OTP full waveform (~4 s on the
+/// 7.5" V2). The panel family's 0.3 s partial spec requires one of these two
+/// alternate waveform sources, selected at init by
+/// [`Epd7in5::new_fast_partial_with_timeout_async`]:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastPartialWaveform {
+    /// Short LUTs loaded into the controller registers (PSR REG=1). Ported from
+    /// GxEPD2's `GxEPD2_750_GDEY075T7` "experimental partial screen update LUTs
+    /// with balanced charge". Panel-batch independent, but the frame counts are
+    /// GxEPD2's empirical tuning, not a Good Display release.
+    RegisterLut,
+    /// The OTP fast-partial waveform that GDEY075T7-era glass ships at forced
+    /// temperature index 0x6E (CCSET TSFIX + TSSET). No register LUTs — the
+    /// factory waveform — but only works on panel batches whose OTP actually
+    /// contains it. GxEPD2 default for current batches.
+    OtpForcedTemperature,
+}
+
+/// Register-LUT length the UC8179 expects for commands 0x20–0x25. GxEPD2 sends
+/// 6 meaningful bytes and zero-pads the rest; the pad is part of the register.
+const FAST_PARTIAL_LUT_LEN: usize = 42;
+
+/// One fast-partial LUT: a single 6-byte group `[levels, T1, T2, T3, T4,
+/// repeat]`, zero-padded. Frame counts are GxEPD2's: T1=30 charge-balance
+/// pre-phase, T2=5 extension, T3=30 color-change phase, T4=5 extension,
+/// repeated once. `levels` packs four 2-bit drive levels for the four phases.
+const fn fast_partial_lut(levels: u8) -> [u8; FAST_PARTIAL_LUT_LEN] {
+    let mut lut = [0u8; FAST_PARTIAL_LUT_LEN];
+    lut[0] = levels;
+    lut[1] = 30;
+    lut[2] = 5;
+    lut[3] = 30;
+    lut[4] = 5;
+    lut[5] = 1;
+    lut
+}
+
+/// LUTC (0x20), VCOM: no drive.
+const FAST_PARTIAL_LUT_VCOM: [u8; FAST_PARTIAL_LUT_LEN] = fast_partial_lut(0x00);
+/// LUTWW (0x21), white→white: no drive.
+const FAST_PARTIAL_LUT_WHITE_TO_WHITE: [u8; FAST_PARTIAL_LUT_LEN] = fast_partial_lut(0x00);
+/// LUTKW (0x22), black→white: `01 01 10 10` — GxEPD2's "more white" variant.
+const FAST_PARTIAL_LUT_BLACK_TO_WHITE: [u8; FAST_PARTIAL_LUT_LEN] = fast_partial_lut(0x5A);
+/// LUTWK (0x23), white→black: `10 00 01 00`.
+const FAST_PARTIAL_LUT_WHITE_TO_BLACK: [u8; FAST_PARTIAL_LUT_LEN] = fast_partial_lut(0x84);
+/// LUTKK (0x24), black→black: no drive.
+const FAST_PARTIAL_LUT_BLACK_TO_BLACK: [u8; FAST_PARTIAL_LUT_LEN] = fast_partial_lut(0x00);
+/// LUTBD (0x25), border: no drive — the border keeps whatever the last full
+/// refresh put there (this fork drives it black via CDI BDV, see `init`).
+const FAST_PARTIAL_LUT_BORDER: [u8; FAST_PARTIAL_LUT_LEN] = fast_partial_lut(0x00);
 
 /// Epd7in5 (V2) driver
 ///
@@ -191,7 +245,10 @@ where
         // 8 horizontal pixels). The reference C demo enforces this by construction;
         // we panic so callers don't silently scramble pixels with off-by-bit windows.
         assert!(x % 8 == 0, "epd7in5_v2: partial x must be multiple of 8");
-        assert!(width % 8 == 0, "epd7in5_v2: partial width must be multiple of 8");
+        assert!(
+            width % 8 == 0,
+            "epd7in5_v2: partial width must be multiple of 8"
+        );
         let row_bytes = (width / 8) as usize;
         assert_eq!(
             buffer.len(),
@@ -424,7 +481,10 @@ where
         timeout_us: u32,
     ) -> Result<(), BusyTimeoutError<SPI::Error>> {
         assert!(x % 8 == 0, "epd7in5_v2: partial x must be multiple of 8");
-        assert!(width % 8 == 0, "epd7in5_v2: partial width must be multiple of 8");
+        assert!(
+            width % 8 == 0,
+            "epd7in5_v2: partial width must be multiple of 8"
+        );
         let row_bytes = (width / 8) as usize;
         assert_eq!(
             buffer.len(),
@@ -492,7 +552,10 @@ where
         timeout_us: u32,
     ) -> Result<(), BusyTimeoutError<SPI::Error>> {
         assert!(x % 8 == 0, "epd7in5_v2: partial x must be multiple of 8");
-        assert!(width % 8 == 0, "epd7in5_v2: partial width must be multiple of 8");
+        assert!(
+            width % 8 == 0,
+            "epd7in5_v2: partial width must be multiple of 8"
+        );
         let row_bytes = (width / 8) as usize;
         assert_eq!(
             old_buffer.len(),
@@ -713,7 +776,9 @@ where
         }
 
         // DTM1 = raw framebuffer, chunked with a cancel check per band.
-        self.interface.cmd_async(spi, Command::DataStartTransmission1).await?;
+        self.interface
+            .cmd_async(spi, Command::DataStartTransmission1)
+            .await?;
         for band in buffer.chunks(ASYNC_WRITE_CHUNK) {
             if should_cancel() {
                 return Ok(RefreshOutcome::Cancelled);
@@ -728,7 +793,9 @@ where
         }
         // DTM2 = bitwise-inverted framebuffer (see `update_frame` polarity note),
         // chunked with the same per-band cancel check.
-        self.interface.cmd_async(spi, Command::DataStartTransmission2).await?;
+        self.interface
+            .cmd_async(spi, Command::DataStartTransmission2)
+            .await?;
         for band in buffer.chunks(ASYNC_WRITE_CHUNK) {
             if should_cancel() {
                 return Ok(RefreshOutcome::Cancelled);
@@ -739,7 +806,9 @@ where
         if should_cancel() {
             return Ok(RefreshOutcome::Cancelled);
         }
-        self.interface.cmd_async(spi, Command::DisplayRefresh).await?;
+        self.interface
+            .cmd_async(spi, Command::DisplayRefresh)
+            .await?;
         Ok(RefreshOutcome::Completed)
     }
 
@@ -770,7 +839,10 @@ where
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<RefreshOutcome, BusyTimeoutError<SPI::Error>> {
         assert!(x % 8 == 0, "epd7in5_v2: partial x must be multiple of 8");
-        assert!(width % 8 == 0, "epd7in5_v2: partial width must be multiple of 8");
+        assert!(
+            width % 8 == 0,
+            "epd7in5_v2: partial width must be multiple of 8"
+        );
         let row_bytes = (width / 8) as usize;
         assert_eq!(
             old_buffer.len(),
@@ -822,7 +894,9 @@ where
             .await?;
 
         // DTM1 = old (raw), chunked with a per-band cancel check.
-        self.interface.cmd_async(spi, Command::DataStartTransmission1).await?;
+        self.interface
+            .cmd_async(spi, Command::DataStartTransmission1)
+            .await?;
         for band in old_buffer.chunks(ASYNC_WRITE_CHUNK) {
             if should_cancel() {
                 return Ok(RefreshOutcome::Cancelled);
@@ -831,7 +905,9 @@ where
         }
 
         // DTM2 = new (raw), chunked with a per-band cancel check.
-        self.interface.cmd_async(spi, Command::DataStartTransmission2).await?;
+        self.interface
+            .cmd_async(spi, Command::DataStartTransmission2)
+            .await?;
         for band in new_buffer.chunks(ASYNC_WRITE_CHUNK) {
             if should_cancel() {
                 return Ok(RefreshOutcome::Cancelled);
@@ -842,7 +918,9 @@ where
         if should_cancel() {
             return Ok(RefreshOutcome::Cancelled);
         }
-        self.interface.cmd_async(spi, Command::DisplayRefresh).await?;
+        self.interface
+            .cmd_async(spi, Command::DisplayRefresh)
+            .await?;
 
         if self
             .wait_until_idle_with_timeout_async(spi, delay, timeout_us, should_cancel)
@@ -943,6 +1021,278 @@ where
             .await?;
         self.interface
             .cmd_with_data_async(spi, Command::TconSetting, &[0x22])
+            .await?;
+        Ok(())
+    }
+
+    // ─── Fast partial-refresh mode ─────────────────────────────────────────
+    //
+    // Init + refresh for the panel family's 0.3 s-class partial waveform. The
+    // init sequence is a faithful port of GxEPD2_750_GDEY075T7 (`_InitDisplay`
+    // + `_Init_Part`), including its redundant PSR/CDI double-writes in the
+    // RegisterLut branch and its config-then-PowerOn order (the plain init
+    // above powers on first, per the Waveshare demo). Async-only: the firmware
+    // has no blocking callers.
+
+    /// Construct + init in fast-partial mode with a BUSY-wait cap. The session
+    /// this creates is for windowed partial refreshes via
+    /// [`update_fast_partial_frame_dual_with_timeout_async`](Self::update_fast_partial_frame_dual_with_timeout_async);
+    /// to run a FULL refresh, first switch back with
+    /// [`reinit_full_with_timeout_async`](Self::reinit_full_with_timeout_async)
+    /// — a full-frame refresh under the short partial LUTs would not clean the
+    /// panel properly.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_fast_partial_with_timeout_async(
+        spi: &mut SPI,
+        busy: BUSY,
+        dc: DC,
+        rst: RST,
+        delay: &mut DELAY,
+        delay_us: Option<u32>,
+        waveform: FastPartialWaveform,
+        timeout_us: u32,
+    ) -> Result<Self, BusyTimeoutError<SPI::Error>> {
+        let interface = DisplayInterface::new(busy, dc, rst, delay_us);
+        let color = DEFAULT_BACKGROUND_COLOR;
+
+        let mut epd = Epd7in5 { interface, color };
+        epd.init_fast_partial_with_timeout_async(spi, delay, waveform, timeout_us)
+            .await?;
+
+        Ok(epd)
+    }
+
+    /// Re-run the plain full-waveform init (reset + OTP LUT + this fork's CDI
+    /// border setting) on an already-constructed instance. Switches a
+    /// fast-partial session back to full-refresh mode; also usable as a
+    /// mid-session recovery re-init.
+    pub async fn reinit_full_with_timeout_async(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        timeout_us: u32,
+    ) -> Result<(), BusyTimeoutError<SPI::Error>> {
+        self.init_with_timeout_async(spi, delay, timeout_us).await
+    }
+
+    /// Dual-buffer windowed partial refresh for a session initialized via
+    /// [`new_fast_partial_with_timeout_async`](Self::new_fast_partial_with_timeout_async).
+    /// Identical wire flow to
+    /// [`update_partial_frame_dual_with_timeout_async`](Self::update_partial_frame_dual_with_timeout_async)
+    /// EXCEPT it never touches CDI: the fast-partial init already selected the
+    /// waveform + data-polarity mode, and rewriting CDI per refresh (the
+    /// OTP-path method swaps 0xA9/0x20) would clobber it. Both buffers are sent
+    /// raw; same cancellation contract as the rest of the async family.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_fast_partial_frame_dual_with_timeout_async(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        old_buffer: &[u8],
+        new_buffer: &[u8],
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        timeout_us: u32,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<RefreshOutcome, BusyTimeoutError<SPI::Error>> {
+        assert!(x % 8 == 0, "epd7in5_v2: partial x must be multiple of 8");
+        assert!(
+            width % 8 == 0,
+            "epd7in5_v2: partial width must be multiple of 8"
+        );
+        let row_bytes = (width / 8) as usize;
+        assert_eq!(
+            old_buffer.len(),
+            row_bytes * height as usize,
+            "epd7in5_v2: partial old_buffer size mismatch",
+        );
+        assert_eq!(
+            new_buffer.len(),
+            row_bytes * height as usize,
+            "epd7in5_v2: partial new_buffer size mismatch",
+        );
+
+        if self
+            .wait_until_idle_with_timeout_async(spi, delay, timeout_us, should_cancel)
+            .await?
+            == RefreshOutcome::Cancelled
+        {
+            return Ok(RefreshOutcome::Cancelled);
+        }
+        // A cancel latched on entry is caught here before the panel is switched
+        // into PartialIn mode (which would otherwise require a hard reset).
+        if should_cancel() {
+            return Ok(RefreshOutcome::Cancelled);
+        }
+
+        self.interface.cmd_async(spi, Command::PartialIn).await?;
+
+        let x_end = x + width - 1;
+        let y_end = y + height - 1;
+        self.interface
+            .cmd_with_data_async(
+                spi,
+                Command::PartialWindow,
+                &[
+                    (x >> 8) as u8,
+                    (x & 0xFF) as u8,
+                    (x_end >> 8) as u8,
+                    (x_end & 0xFF) as u8,
+                    (y >> 8) as u8,
+                    (y & 0xFF) as u8,
+                    (y_end >> 8) as u8,
+                    (y_end & 0xFF) as u8,
+                    0x01,
+                ],
+            )
+            .await?;
+
+        // DTM1 = old (raw), chunked with a per-band cancel check.
+        self.interface
+            .cmd_async(spi, Command::DataStartTransmission1)
+            .await?;
+        for band in old_buffer.chunks(ASYNC_WRITE_CHUNK) {
+            if should_cancel() {
+                return Ok(RefreshOutcome::Cancelled);
+            }
+            self.interface.data_async(spi, band).await?;
+        }
+
+        // DTM2 = new (raw), chunked with a per-band cancel check.
+        self.interface
+            .cmd_async(spi, Command::DataStartTransmission2)
+            .await?;
+        for band in new_buffer.chunks(ASYNC_WRITE_CHUNK) {
+            if should_cancel() {
+                return Ok(RefreshOutcome::Cancelled);
+            }
+            self.interface.data_async(spi, band).await?;
+        }
+
+        if should_cancel() {
+            return Ok(RefreshOutcome::Cancelled);
+        }
+        self.interface
+            .cmd_async(spi, Command::DisplayRefresh)
+            .await?;
+
+        if self
+            .wait_until_idle_with_timeout_async(spi, delay, timeout_us, should_cancel)
+            .await?
+            == RefreshOutcome::Cancelled
+        {
+            return Ok(RefreshOutcome::Cancelled);
+        }
+
+        self.interface.cmd_async(spi, Command::PartialOut).await?;
+
+        Ok(RefreshOutcome::Completed)
+    }
+
+    /// Fast-partial init: GxEPD2_750_GDEY075T7 `_InitDisplay` + `_Init_Part`,
+    /// ported command-for-command (including the RegisterLut branch's PSR and
+    /// CDI double-writes), then `_PowerOn`. Plain async, NO cancel hook — init
+    /// must run to completion to leave the panel usable.
+    async fn init_fast_partial_with_timeout_async(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        waveform: FastPartialWaveform,
+        timeout_us: u32,
+    ) -> Result<(), BusyTimeoutError<SPI::Error>> {
+        self.interface.reset_async(delay, 10_000, 2_000).await;
+
+        // _InitDisplay
+        self.interface
+            .cmd_with_data_async(spi, Command::PanelSetting, &[0x1F])
+            .await?;
+        // 5-byte PowerSetting (the plain init sends 4): the fifth byte is
+        // VDHR=4.2V, per GxEPD2 "same POWER SETTING as from OTP".
+        self.interface
+            .cmd_with_data_async(spi, Command::PowerSetting, &[0x07, 0x07, 0x3F, 0x3F, 0x09])
+            .await?;
+        self.interface
+            .cmd_with_data_async(spi, Command::BoosterSoftStart, &[0x17, 0x17, 0x28, 0x17])
+            .await?;
+        self.interface
+            .cmd_with_data_async(spi, Command::TconResolution, &[0x03, 0x20, 0x01, 0xE0])
+            .await?;
+        self.interface
+            .cmd_with_data_async(spi, Command::DualSpi, &[0x00])
+            .await?;
+        // CDI 0x29: LUTKW border + N2OCP (copy-new-to-old) + DDX=01. NOTE: not
+        // this fork's black-border 0x20 — bench the border visually; the
+        // partial path's border LUT is no-drive so the border should hold the
+        // last full refresh's state either way.
+        self.interface
+            .cmd_with_data_async(spi, Command::VcomAndDataIntervalSetting, &[0x29, 0x07])
+            .await?;
+        self.interface
+            .cmd_with_data_async(spi, Command::TconSetting, &[0x22])
+            .await?;
+        self.interface
+            .cmd_with_data_async(spi, Command::PowerSaving, &[0x22])
+            .await?;
+
+        // _Init_Part
+        match waveform {
+            FastPartialWaveform::OtpForcedTemperature => {
+                self.interface
+                    .cmd_with_data_async(spi, Command::CascadeSetting, &[0x02])
+                    .await?;
+                self.interface
+                    .cmd_with_data_async(spi, Command::ForceTemperature, &[0x6E])
+                    .await?;
+            }
+            FastPartialWaveform::RegisterLut => {
+                self.interface
+                    .cmd_with_data_async(spi, Command::PanelSetting, &[0x3F])
+                    .await?;
+                // VCOM_DC -2.5V, "same value as in OTP" per GxEPD2.
+                self.interface
+                    .cmd_with_data_async(spi, Command::VcmDcSetting, &[0x30])
+                    .await?;
+                // CDI 0x39: LUTBD border + N2OCP + DDX=01.
+                self.interface
+                    .cmd_with_data_async(spi, Command::VcomAndDataIntervalSetting, &[0x39, 0x07])
+                    .await?;
+                self.interface
+                    .cmd_with_data_async(spi, Command::LutForVcom, &FAST_PARTIAL_LUT_VCOM)
+                    .await?;
+                self.interface
+                    .cmd_with_data_async(spi, Command::LutBlack, &FAST_PARTIAL_LUT_WHITE_TO_WHITE)
+                    .await?;
+                self.interface
+                    .cmd_with_data_async(spi, Command::LutWhite, &FAST_PARTIAL_LUT_BLACK_TO_WHITE)
+                    .await?;
+                self.interface
+                    .cmd_with_data_async(spi, Command::LutGray1, &FAST_PARTIAL_LUT_WHITE_TO_BLACK)
+                    .await?;
+                self.interface
+                    .cmd_with_data_async(spi, Command::LutGray2, &FAST_PARTIAL_LUT_BLACK_TO_BLACK)
+                    .await?;
+                self.interface
+                    .cmd_with_data_async(spi, Command::LutRed0, &FAST_PARTIAL_LUT_BORDER)
+                    .await?;
+            }
+        }
+
+        // _PowerOn: config first, THEN power on (the plain init above does the
+        // reverse, per the Waveshare demo).
+        self.interface.cmd_async(spi, Command::PowerOn).await?;
+        delay.delay_ms(100).await;
+        let mut never_cancel = || false;
+        self.interface
+            .wait_until_idle_with_cmd_timeout_async(
+                spi,
+                delay,
+                IS_BUSY_LOW,
+                Command::GetStatus,
+                timeout_us,
+                &mut never_cancel,
+            )
             .await?;
         Ok(())
     }

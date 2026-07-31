@@ -136,9 +136,16 @@ pub(crate) enum Command {
     ReadVcomValue = 0x81,
     /// This command sets `VCOM_DC` value.
     VcmDcSetting = 0x82,
-    // /// This is in all the Waveshare controllers for Epd7in5, but it's not documented
-    // /// anywhere in the datasheet `¯\_(ツ)_/¯`
-    // FlashMode = 0xE5,
+
+    /// Cascade Setting (CCSET). Bit 1 (`TSFIX`) makes the waveform-selection
+    /// temperature come from the `ForceTemperature` register instead of the
+    /// internal sensor — the hook the OTP fast-partial waveform hides behind.
+    CascadeSetting = 0xE0,
+    /// Power Saving (PWS): VCOM and source power-saving line periods.
+    PowerSaving = 0xE3,
+    /// Force Temperature (TSSET): the temperature value used for OTP waveform
+    /// selection when `CascadeSetting` has `TSFIX` set.
+    ForceTemperature = 0xE5,
 }
 
 impl traits::Command for Command {

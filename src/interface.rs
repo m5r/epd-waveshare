@@ -339,7 +339,11 @@ where
     }
 
     /// Async [`data`](Self::data).
-    pub(crate) async fn data_async(&mut self, spi: &mut SPI, data: &[u8]) -> Result<(), SPI::Error> {
+    pub(crate) async fn data_async(
+        &mut self,
+        spi: &mut SPI,
+        data: &[u8],
+    ) -> Result<(), SPI::Error> {
         let _ = self.dc.set_high();
         if SINGLE_BYTE_WRITE {
             for val in data.iter().copied() {
