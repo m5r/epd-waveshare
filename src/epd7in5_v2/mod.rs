@@ -1075,6 +1075,22 @@ where
         self.init_with_timeout_async(spi, delay, timeout_us).await
     }
 
+    /// Re-run the fast-partial init on an already-constructed instance — the
+    /// mirror of [`reinit_full_with_timeout_async`](Self::reinit_full_with_timeout_async).
+    /// Switches a full-waveform session into fast-partial mode mid-session, so
+    /// a long-lived session (e.g. a per-minute refresh loop) can return to the
+    /// fast partial waveform after an escalated full refresh.
+    pub async fn reinit_fast_partial_with_timeout_async(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        waveform: FastPartialWaveform,
+        timeout_us: u32,
+    ) -> Result<(), BusyTimeoutError<SPI::Error>> {
+        self.init_fast_partial_with_timeout_async(spi, delay, waveform, timeout_us)
+            .await
+    }
+
     /// Dual-buffer windowed partial refresh for a session initialized via
     /// [`new_fast_partial_with_timeout_async`](Self::new_fast_partial_with_timeout_async).
     /// Identical wire flow to
